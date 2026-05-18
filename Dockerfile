@@ -9,7 +9,7 @@
 #   DAST_REDIS_PASS   默认 redis                      Redis 密码(为空表示无密码)
 # MySQL/Redis 地址、端口由 ConfigMap 中的 scheduler.internal_ip / mysql_port / redis_port 决定。
 
-FROM golang:1.23-alpine AS builder
+FROM golang:1.25-alpine AS builder
 WORKDIR /src
 # ENV GOPROXY=https://goproxy.cn,direct
 COPY . .
