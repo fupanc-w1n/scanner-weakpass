@@ -6,6 +6,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -19,8 +21,12 @@ type DB struct {
 
 // Open 建立连接
 func Open(addr, user, pass, name string) (*DB, error) {
-	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?charset=utf8mb4&parseTime=true",
-		user, pass, addr, name)
+	tz := localTimezone()
+	if loc, err := time.LoadLocation(tz); err == nil {
+		time.Local = loc
+	}
+	dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?charset=utf8mb4&parseTime=true&loc=%s",
+		user, pass, addr, name, url.QueryEscape(tz))
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
@@ -32,6 +38,16 @@ func Open(addr, user, pass, name string) (*DB, error) {
 		return nil, fmt.Errorf("ping mysql: %w", err)
 	}
 	return &DB{conn: db}, nil
+}
+
+func localTimezone() string {
+	if v := os.Getenv("TZ"); v != "" {
+		return v
+	}
+	if v := os.Getenv("DAST_TIMEZONE"); v != "" {
+		return v
+	}
+	return "Asia/Shanghai"
 }
 
 // Close 关闭

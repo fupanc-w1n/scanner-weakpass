@@ -25,5 +25,6 @@ ENV DAST_CONFIG=/app/config/config.json \
     DAST_DB_USER=root \
     DAST_DB_PASS=fupanC@123 \
     DAST_DB_NAME=dast \
-    DAST_REDIS_PASS=redis
+    DAST_REDIS_PASS=redis \
+    TZ=Asia/Shanghai
 ENTRYPOINT ["/app/scanner-weakpass"]
