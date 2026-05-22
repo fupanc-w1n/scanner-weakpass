@@ -73,33 +73,67 @@ func main() {
 func handleWeakPass(ctx context.Context, cfg *scannerconfig.Config, mc *scannerconfig.WeakPassConfig,
 	mdb *mysqldb.DB, msg *worker.BusinessMessage) worker.HandlerResult {
 
-	targets, err := mdb.QueryServiceTargets(ctx, msg.TaskID, msg.Hosts, []string{"ssh", "mysql", "redis"})
+	log.Printf("weakpass task=%d part=%s hosts=%v", msg.TaskID, msg.TaskPartName, msg.Hosts)
+
+	targets, err := mdb.QueryWeakPassServiceTargets(ctx, msg.TaskID, msg.TaskPartName, msg.Hosts)
 	if err != nil {
 		return worker.HandlerResult{Err: fmt.Errorf("query services: %w", err)}
+	}
+	if err := mdb.DeleteWeakPassFindingsForHosts(ctx, msg.TaskID, msg.TaskPartName, msg.Hosts); err != nil {
+		return worker.HandlerResult{Err: fmt.Errorf("delete old weakpass findings: %w", err)}
 	}
 	// 按 host 维度并发处理,每个 host 内部独立 limiter
 	var wg sync.WaitGroup
 	hostTargets := groupByHost(targets)
+	errCh := make(chan error, len(hostTargets))
+	countCh := make(chan int, len(hostTargets))
 	for host, items := range hostTargets {
 		wg.Add(1)
 		go func(host string, items []mysqldb.ServiceTarget) {
 			defer wg.Done()
+			findings := 0
 			limiter := rate.NewLimiter(rate.Limit(mc.QPS), 1)
 			for _, t := range items {
 				dict, ok := mc.Dictionary[strings.ToLower(t.Service)]
 				if !ok {
 					continue
 				}
-				tryCredentials(ctx, mdb, msg.TaskID, msg.TaskPartName, host, t.Port, t.Service, dict, limiter)
+				n, err := tryCredentials(ctx, mdb, msg.TaskID, msg.TaskPartName, host, t.Port, t.Service, dict, limiter)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				findings += n
 			}
+			countCh <- findings
 		}(host, items)
 	}
 	wg.Wait()
+	close(errCh)
+	close(countCh)
+	for err := range errCh {
+		if err != nil {
+			return worker.HandlerResult{Err: err}
+		}
+	}
+	findings := 0
+	for n := range countCh {
+		findings += n
+	}
+	log.Printf("weakpass task=%d part=%s service_targets=%d target_hosts=%d findings=%d", msg.TaskID, msg.TaskPartName, len(targets), len(hostTargets), findings)
 
+	if err := ctx.Err(); err != nil {
+		return worker.HandlerResult{Err: err}
+	}
 	if err := mdb.SetWeakPassStatus(ctx, msg.TaskID, msg.TaskPartName, "completed"); err != nil {
 		return worker.HandlerResult{Err: err}
 	}
-	_, _ = mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName)
+	if _, err := mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName); err != nil {
+		return worker.HandlerResult{Err: err}
+	}
+	recordTaskEvent(ctx, mdb, msg.TaskID, "weakpass",
+		fmt.Sprintf("weakpass part completed: part=%s service_targets=%d target_hosts=%d findings=%d", msg.TaskPartName, len(targets), len(hostTargets), findings),
+		map[string]interface{}{"task_part_name": msg.TaskPartName, "service_targets": len(targets), "target_hosts": len(hostTargets), "findings": findings})
 	return worker.HandlerResult{}
 }
 
@@ -112,22 +146,22 @@ func groupByHost(in []mysqldb.ServiceTarget) map[string][]mysqldb.ServiceTarget 
 }
 
 func tryCredentials(ctx context.Context, mdb *mysqldb.DB, taskID uint64, partName, host string, port int, service string,
-	dict scannerconfig.ServiceDict, limiter *rate.Limiter) {
+	dict scannerconfig.ServiceDict, limiter *rate.Limiter) (int, error) {
 
 	hit := false
 	for _, user := range dict.Username {
 		if hit {
-			return
+			return 1, nil
 		}
 		for _, pass := range dict.Password {
 			if err := limiter.Wait(ctx); err != nil {
-				return
+				return 0, err
 			}
 			ok := tryOne(ctx, service, host, port, user, pass)
 			if !ok {
 				continue
 			}
-			_ = mdb.InsertWeakPassFinding(ctx, mysqldb.WeakPassFinding{
+			if err := mdb.InsertWeakPassFinding(ctx, mysqldb.WeakPassFinding{
 				TaskID:       taskID,
 				TaskPartName: partName,
 				Host:         host,
@@ -135,11 +169,17 @@ func tryCredentials(ctx context.Context, mdb *mysqldb.DB, taskID uint64, partNam
 				Service:      service,
 				Username:     user,
 				Password:     pass,
-			})
+			}); err != nil {
+				return 0, fmt.Errorf("insert weakpass finding host=%s port=%d service=%s: %w", host, port, service, err)
+			}
 			hit = true
 			break
 		}
 	}
+	if hit {
+		return 1, nil
+	}
+	return 0, nil
 }
 
 func tryOne(ctx context.Context, service, host string, port int, user, pass string) bool {
@@ -202,4 +242,10 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func recordTaskEvent(ctx context.Context, mdb *mysqldb.DB, taskID uint64, module, message string, meta map[string]interface{}) {
+	if err := mdb.InsertTaskEvent(ctx, taskID, "info", module, message, meta); err != nil {
+		log.Printf("%s task=%d event insert err=%v", module, taskID, err)
+	}
 }
